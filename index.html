@@ -143,6 +143,7 @@
         <button id="copy" disabled>COPY</button>
         <button id="txt" disabled>SAVE TXT</button>
         <button id="png" disabled>SAVE PNG</button>
+        <button id="vid" disabled>SAVE VID</button>
       </div>
       <table>
         <tr><td class="lbl">WIDTH</td><td><input type="range" id="width" min="40" max="300" value="140"> <span class="val" id="widthV">140</span></td></tr>
@@ -176,7 +177,7 @@
     brightness:$('brightness'), brightnessV:$('brightnessV'),
     color:$('color'), invert:$('invert'),
     out:$('out'), hint:$('hint'), wrap:$('wrap'),
-    play:$('play'), copy:$('copy'), txt:$('txt'), png:$('png'),
+    play:$('play'), copy:$('copy'), txt:$('txt'), png:$('png'), vid:$('vid'),
   };
   const canvas = document.createElement('canvas');
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
@@ -187,7 +188,7 @@
   let mode = 'still';       // 'still' | 'frames' | 'video'
   let frames = null;        // animated images: [{bitmap, duration(ms)}]
   let frameIdx = 0;
-  let timer = null, raf = null, playing = false;
+  let timer = null, raf = null, playing = false, recording = false;
   let videoEl = null, objUrl = null;
 
   const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -251,6 +252,7 @@
     const animated = mode !== 'still';
     el.play.disabled = !animated;
     el.play.textContent = !animated ? '▶ PLAY' : (playing ? '❚❚ PAUSE' : '▶ PLAY');
+    if (!recording) el.vid.disabled = !animated;
   }
   function playFrames() {
     stop(); playing = true; setPlayBtn();
@@ -357,10 +359,10 @@
     a.href=URL.createObjectURL(new Blob([plainText],{type:'text/plain'}));
     a.download='ascii-art.txt'; a.click(); URL.revokeObjectURL(a.href);
   });
-  el.png.addEventListener('click', () => {
+  // draw the current ASCII (plainText + color from main canvas) onto a canvas
+  function drawAscii(o) {
     const lines=plainText.split('\n'), fs=12, lh=fs, cw=fs*0.6;
-    const o=document.createElement('canvas');
-    o.width=Math.ceil((lines[0]?.length||1)*cw); o.height=lines.length*lh;
+    o.width=Math.max(1,Math.ceil((lines[0]?.length||1)*cw)); o.height=Math.max(1,lines.length*lh);
     const c=o.getContext('2d');
     c.fillStyle='#1a1430'; c.fillRect(0,0,o.width,o.height);
     c.font=`${fs}px monospace`; c.textBaseline='top';
@@ -371,7 +373,70 @@
       else c.fillStyle='#ffd9f0';
       c.fillText(lines[y][x], x*cw, y*lh);
     }
+    return o;
+  }
+
+  el.png.addEventListener('click', () => {
+    const o=drawAscii(document.createElement('canvas'));
     const a=document.createElement('a'); a.href=o.toDataURL('image/png'); a.download='ascii-art.png'; a.click();
+  });
+
+  // ---- export animation as video (MediaRecorder over a canvas stream) -------
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  function pickMime() {
+    const cands = ['video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm','video/mp4'];
+    return cands.find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || '';
+  }
+
+  el.vid.addEventListener('click', async () => {
+    if (recording || mode === 'still' || !window.MediaRecorder) return;
+    const wasPlaying = playing;
+    recording = true; stop(); if (videoEl) videoEl.pause();
+    el.vid.disabled = true; el.vid.textContent = 'REC…';
+
+    // prime first frame so the output canvas + capture size are set
+    if (mode === 'frames') source = frames[0].bitmap;
+    render();
+    const o = drawAscii(document.createElement('canvas'));
+    const mime = pickMime();
+    const stream = o.captureStream(0);
+    const track = stream.getVideoTracks()[0];
+    const rec = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 8e6 } : {});
+    const chunks = [];
+    rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+    const stopped = new Promise(res => { rec.onstop = res; });
+    rec.start();
+    const grab = () => { drawAscii(o); track.requestFrame && track.requestFrame(); };
+
+    try {
+      if (mode === 'frames') {
+        for (let k = 0; k < frames.length; k++) {
+          source = frames[k].bitmap; render(); grab();
+          await sleep(frames[k].duration || 100);
+        }
+      } else { // video — record one full pass
+        const v = videoEl; v.loop = false; v.currentTime = 0;
+        await v.play().catch(()=>{});
+        await new Promise(res => {
+          v.addEventListener('ended', res, { once: true });
+          const loop = () => { if (v.ended || v.paused) { res(); return; } render(); grab(); requestAnimationFrame(loop); };
+          requestAnimationFrame(loop);
+        });
+        v.loop = true;
+      }
+    } catch (e) { /* fall through to finalize */ }
+
+    rec.stop();
+    await stopped;
+    const blob = new Blob(chunks, { type: mime || 'video/webm' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'ascii-anim.' + (mime.includes('mp4') ? 'mp4' : 'webm');
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+
+    recording = false; el.vid.textContent = 'SAVE VID'; setPlayBtn();
+    if (wasPlaying) resume();
   });
 })();
 </script>
