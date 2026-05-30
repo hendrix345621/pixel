@@ -131,14 +131,15 @@
 <div class="page">
 
   <h1>pixel ascii</h1>
-  <div class="sub">★ image to ascii art ★</div>
+  <div class="sub">★ image · gif · video to ascii ★</div>
 
   <div class="pixel">
     <div class="bar">CONTROLS</div>
     <div class="body">
       <div>
-        <label class="fakebtn" for="file">LOAD IMAGE</label>
-        <input type="file" id="file" accept="image/*">
+        <label class="fakebtn" for="file">LOAD MEDIA</label>
+        <input type="file" id="file" accept="image/*,video/*">
+        <button id="play" disabled>▶ PLAY</button>
         <button id="copy" disabled>COPY</button>
         <button id="txt" disabled>SAVE TXT</button>
         <button id="png" disabled>SAVE PNG</button>
@@ -157,7 +158,7 @@
 
   <div id="wrap">
     <pre id="out"></pre>
-    <p class="hint" id="hint">drag &amp; drop · paste · or load an image<br><span class="blink">▮</span></p>
+    <p class="hint" id="hint">drag &amp; drop · paste · or load an image / gif / video<br><span class="blink">▮</span></p>
   </div>
 
   <div class="footer">runs in your browser · nothing uploaded</div>
@@ -175,20 +176,34 @@
     brightness:$('brightness'), brightnessV:$('brightnessV'),
     color:$('color'), invert:$('invert'),
     out:$('out'), hint:$('hint'), wrap:$('wrap'),
-    copy:$('copy'), txt:$('txt'), png:$('png'),
+    play:$('play'), copy:$('copy'), txt:$('txt'), png:$('png'),
   };
   const canvas = document.createElement('canvas');
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  let img = null, plainText = "";
+  let plainText = "";
+
+  // playback state -----------------------------------------------------------
+  let source = null;        // current drawable: Image | ImageBitmap | HTMLVideoElement
+  let mode = 'still';       // 'still' | 'frames' | 'video'
+  let frames = null;        // animated images: [{bitmap, duration(ms)}]
+  let frameIdx = 0;
+  let timer = null, raf = null, playing = false;
+  let videoEl = null, objUrl = null;
+
   const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const srcDims = s => s instanceof HTMLVideoElement
+    ? [s.videoWidth, s.videoHeight]
+    : [s.width || s.naturalWidth, s.height || s.naturalHeight];
 
   function render() {
-    if (!img) return;
+    if (!source) return;
+    const [sw, sh] = srcDims(source);
+    if (!sw || !sh) return;
     const cols = +el.width.value;
-    const rows = Math.max(1, Math.round(cols * (img.height/img.width) * CHAR_ASPECT));
+    const rows = Math.max(1, Math.round(cols * (sh/sw) * CHAR_ASPECT));
     canvas.width = cols; canvas.height = rows;
     ctx.clearRect(0,0,cols,rows);
-    ctx.drawImage(img, 0, 0, cols, rows);
+    ctx.drawImage(source, 0, 0, cols, rows);
     const data = ctx.getImageData(0,0,cols,rows).data;
     const contrast = +el.contrast.value, bright = +el.brightness.value;
     const cF = (259*(contrast+255))/(255*(259-contrast));
@@ -220,13 +235,105 @@
     el.copy.disabled = el.txt.disabled = el.png.disabled = false;
   }
 
-  function load(file) {
-    if (!file || !file.type.startsWith('image/')) { alert('not an image!'); return; }
+  // ---- playback control ----------------------------------------------------
+  function stop() {
+    playing = false;
+    if (timer) { clearTimeout(timer); timer = null; }
+    if (raf) { cancelAnimationFrame(raf); raf = null; }
+  }
+  function reset() {
+    stop();
+    if (videoEl) { videoEl.pause(); videoEl.src = ''; videoEl = null; }
+    if (objUrl) { URL.revokeObjectURL(objUrl); objUrl = null; }
+    frames = null; frameIdx = 0;
+  }
+  function setPlayBtn() {
+    const animated = mode !== 'still';
+    el.play.disabled = !animated;
+    el.play.textContent = !animated ? '▶ PLAY' : (playing ? '❚❚ PAUSE' : '▶ PLAY');
+  }
+  function playFrames() {
+    stop(); playing = true; setPlayBtn();
+    const step = () => {
+      if (!playing || mode !== 'frames' || !frames) return;
+      source = frames[frameIdx].bitmap;
+      render();
+      const dur = frames[frameIdx].duration || 100;
+      frameIdx = (frameIdx + 1) % frames.length;
+      timer = setTimeout(step, dur);
+    };
+    step();
+  }
+  function playVideo() {
+    stop(); playing = true; setPlayBtn();
+    if (videoEl) videoEl.play().catch(()=>{});
+    const step = () => {
+      if (!playing || mode !== 'video') return;
+      render();
+      raf = requestAnimationFrame(step);
+    };
+    step();
+  }
+  function resume() { if (mode === 'frames') playFrames(); else if (mode === 'video') playVideo(); }
+
+  el.play.addEventListener('click', () => {
+    if (mode === 'still') return;
+    if (playing) { stop(); if (videoEl) videoEl.pause(); setPlayBtn(); }
+    else resume();
+  });
+
+  // ---- loaders -------------------------------------------------------------
+  function loadImage(file) {
     const url = URL.createObjectURL(file);
     const i = new Image();
-    i.onload = () => { img = i; render(); URL.revokeObjectURL(url); };
+    i.onload = () => {
+      reset(); mode = 'still'; source = i; setPlayBtn(); render();
+      URL.revokeObjectURL(url);
+    };
     i.onerror = () => { alert('load failed!'); URL.revokeObjectURL(url); };
     i.src = url;
+  }
+
+  async function loadAnimated(file) {
+    if (!('ImageDecoder' in window)) return false;
+    try {
+      const buf = await file.arrayBuffer();
+      const dec = new ImageDecoder({ data: buf, type: file.type });
+      await dec.tracks.ready;
+      const count = dec.tracks.selectedTrack?.frameCount || 0;
+      if (count < 2) { dec.close?.(); return false; }
+      const fr = [];
+      for (let k = 0; k < count; k++) {
+        const { image } = await dec.decode({ frameIndex: k });
+        fr.push({ bitmap: await createImageBitmap(image), duration: image.duration ? image.duration/1000 : 100 });
+        image.close?.();
+      }
+      dec.close?.();
+      reset(); frames = fr; frameIdx = 0; mode = 'frames'; source = frames[0].bitmap;
+      playFrames();
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function loadVideo(file) {
+    const url = URL.createObjectURL(file);
+    const v = document.createElement('video');
+    v.muted = true; v.loop = true; v.playsInline = true; v.autoplay = true;
+    v.addEventListener('loadeddata', () => {
+      reset(); objUrl = url; videoEl = v; source = v; mode = 'video';
+      playVideo();
+    }, { once: true });
+    v.addEventListener('error', () => { alert('video load failed!'); URL.revokeObjectURL(url); });
+    v.src = url;
+  }
+
+  async function load(file) {
+    if (!file) return;
+    if (file.type.startsWith('video/')) { loadVideo(file); return; }
+    if (!file.type.startsWith('image/')) { alert('not an image or video!'); return; }
+    const animCandidate = /gif|webp|apng|png/.test(file.type);
+    if (animCandidate && await loadAnimated(file)) return;
+    loadImage(file);
   }
 
   el.file.addEventListener('change', e => load(e.target.files[0]));
@@ -234,7 +341,7 @@
   bind(el.width, el.widthV); bind(el.contrast, el.contrastV); bind(el.brightness, el.brightnessV);
   el.color.addEventListener('change', render);
   el.invert.addEventListener('change', render);
-  window.addEventListener('resize', () => img && render());
+  window.addEventListener('resize', () => source && render());
 
   document.addEventListener('dragover', e => { e.preventDefault(); document.body.classList.add('dragging'); });
   document.addEventListener('dragleave', e => { if (e.relatedTarget===null) document.body.classList.remove('dragging'); });
