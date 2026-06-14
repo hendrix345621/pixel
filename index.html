@@ -487,10 +487,20 @@ return { GIFEncoder: ct, quantize: H, applyPalette: nt };
     exportEnd(el.gif, wasPlaying);
   });
 
-  // ---- SAVE VID (WebM/MP4 via MediaRecorder) --------------------------------
-  function pickMime() {
-    const cands = ['video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm','video/mp4'];
-    return cands.find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || '';
+  // ---- SAVE VID (MP4/H.264 when supported, else WebM) -----------------------
+  // pick the most widely-playable container the browser can actually record
+  function pickFormat() {
+    const cands = [
+      ['video/mp4;codecs=avc1.640028', 'mp4'],   // H.264 — plays natively on Windows/macOS
+      ['video/mp4;codecs=avc1', 'mp4'],
+      ['video/mp4', 'mp4'],
+      ['video/webm;codecs=vp9', 'webm'],
+      ['video/webm;codecs=vp8', 'webm'],
+      ['video/webm', 'webm'],
+    ];
+    for (const [m, e] of cands)
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) return { mime: m, ext: e };
+    return { mime: '', ext: 'webm' };
   }
 
   el.vid.addEventListener('click', async () => {
@@ -498,29 +508,37 @@ return { GIFEncoder: ct, quantize: H, applyPalette: nt };
     if (!window.MediaRecorder) { status('video recording not supported in this browser', true); return; }
     const wasPlaying = playing;
     exportStart(el.vid, 'REC…');
+    let vidTimer = null;
     try {
-      // prime first frame, then size the capture canvas ONCE.
-      // (resizing a captured canvas mid-recording is what corrupted the old output)
+      // prime first frame; the capture canvas is sized ONCE and never resized after
       if (mode === 'frames') source = frames[0].bitmap;
       render();
       const rc = drawAscii(document.createElement('canvas'));
       const rctx = rc.getContext('2d');
-      const mime = pickMime();
-      const stream = rc.captureStream(0);
-      const track = stream.getVideoTracks()[0];
-      const repaint = () => { paintAscii(rctx, asciiMetrics()); track.requestFrame && track.requestFrame(); };
-      const rec = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 8e6 } : {});
+      const draw = () => paintAscii(rctx, asciiMetrics());
+      // continuous capture: the browser samples the canvas at FPS on its own.
+      // (the old captureStream(0)+requestFrame path produced frozen clips)
+      const stream = rc.captureStream(30);
+      const { mime, ext } = pickFormat();
+      const rec = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 1e7 } : {});
       const chunks = [];
-      rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+      rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
       const stopped = new Promise(res => { rec.onstop = res; });
-      rec.start();
+      rec.start(100);   // timeslice => periodic dataavailable, more robust flushing
 
       if (mode === 'frames') {
-        for (let k = 0; k < frames.length; k++) {
-          source = frames[k].bitmap; render(); repaint();
-          status('recording ' + (k + 1) + '/' + frames.length);
-          await sleep(frames[k].duration || 100);
-        }
+        // play frames in real time onto the capture canvas
+        await new Promise(res => {
+          let k = 0;
+          const tick = () => {
+            source = frames[k].bitmap; render(); draw();
+            status('recording ' + (k + 1) + '/' + frames.length);
+            const dur = frames[k].duration || 100;
+            k++;
+            vidTimer = setTimeout(k >= frames.length ? res : tick, dur);
+          };
+          tick();
+        });
       } else {
         const v = videoEl, back = v.currentTime; v.loop = false; v.currentTime = 0;
         await v.play().catch(()=>{});
@@ -528,7 +546,7 @@ return { GIFEncoder: ct, quantize: H, applyPalette: nt };
           v.addEventListener('ended', res, { once: true });
           const loop = () => {
             if (v.ended || v.paused) { res(); return; }
-            source = v; render(); repaint();
+            source = v; render(); draw();
             status('recording ' + v.currentTime.toFixed(1) + 's');
             raf = requestAnimationFrame(loop);
           };
@@ -540,12 +558,12 @@ return { GIFEncoder: ct, quantize: H, applyPalette: nt };
       rec.stop();
       await stopped;
       if (!chunks.length) throw new Error('empty recording');
-      const ext = mime.includes('mp4') ? 'mp4' : 'webm';
       downloadBlob(new Blob(chunks, { type: mime || 'video/webm' }), 'ascii-anim.' + ext);
-      status('saved ascii-anim.' + ext);
+      status('saved ascii-anim.' + ext + (ext === 'webm' ? ' · webm plays in any browser/VLC' : ''));
     } catch (e) {
       status('video export failed: ' + ((e && e.message) || e), true);
     }
+    if (vidTimer) clearTimeout(vidTimer);
     exportEnd(el.vid, wasPlaying);
   });
 })();
